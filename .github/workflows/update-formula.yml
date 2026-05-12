@@ -1,0 +1,133 @@
+name: Update Formula
+
+# Triggered by the main Eresus-sentinel repo via repository_dispatch
+# after build-packages workflow completes and uploads release assets.
+#
+# Main repo sends:
+#   event_type: "new-release"
+#   client_payload: { version: "0.1.0" }
+
+on:
+  repository_dispatch:
+    types: [new-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to update formula to (without v prefix)"
+        required: true
+
+jobs:
+  update-formula:
+    name: Update sentinel.rb
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Resolve version
+        id: version
+        run: |
+          V="${{ github.event.client_payload.version }}"
+          [ -z "$V" ] && V="${{ github.event.inputs.version }}"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=v${V}" >> "$GITHUB_OUTPUT"
+
+      - name: Download release assets and compute SHA256
+        id: sha
+        run: |
+          V="${{ steps.version.outputs.version }}"
+          BASE="https://github.com/EresusSecurity/Eresus-sentinel/releases/download/v${V}"
+
+          download_sha256() {
+            local name="$1"
+            local url="${BASE}/${name}"
+            echo "Downloading ${name}..." >&2
+            if curl -fsSL --retry 3 -o "/tmp/${name}" "${url}" 2>/dev/null; then
+              sha256sum "/tmp/${name}" | awk '{print $1}'
+            else
+              echo "NOT_FOUND"
+            fi
+          }
+
+          ARM64_FILE="sentinel-${V}.arm64_monterey.bottle.tar.gz"
+          X86_FILE="sentinel-${V}.x86_64_monterey.bottle.tar.gz"
+          LINUX_FILE="sentinel-${V}-linux-x86_64.tar.gz"
+
+          SHA_ARM64=$(download_sha256 "$ARM64_FILE")
+          SHA_X86=$(download_sha256 "$X86_FILE")
+          SHA_LINUX=$(download_sha256 "$LINUX_FILE")
+
+          echo "arm64=$SHA_ARM64"   >> "$GITHUB_OUTPUT"
+          echo "x86=$SHA_X86"       >> "$GITHUB_OUTPUT"
+          echo "linux=$SHA_LINUX"   >> "$GITHUB_OUTPUT"
+
+          echo "SHA arm64 : $SHA_ARM64"
+          echo "SHA x86   : $SHA_X86"
+          echo "SHA linux : $SHA_LINUX"
+
+      - name: Patch formula
+        run: |
+          V="${{ steps.version.outputs.version }}"
+          SHA_ARM64="${{ steps.sha.outputs.arm64 }}"
+          SHA_X86="${{ steps.sha.outputs.x86 }}"
+          SHA_LINUX="${{ steps.sha.outputs.linux }}"
+          FORMULA="Formula/sentinel.rb"
+
+          # Update version
+          sed -i "s/version \"[^\"]*\"/version \"${V}\"/" "$FORMULA"
+
+          # Update SHA256 placeholders or existing values
+          # ARM64
+          awk -v sha="$SHA_ARM64" '
+            /arm64_monterey\.bottle\.tar\.gz/{found_arm64=1}
+            found_arm64 && /sha256/{sub(/"[a-fA-F0-9]+"/, "\"" sha "\""); found_arm64=0}
+            {print}
+          ' "$FORMULA" > /tmp/formula.tmp && mv /tmp/formula.tmp "$FORMULA"
+
+          # x86_64
+          awk -v sha="$SHA_X86" '
+            /x86_64_monterey\.bottle\.tar\.gz/{found_x86=1}
+            found_x86 && /sha256/{sub(/"[a-fA-F0-9]+"/, "\"" sha "\""); found_x86=0}
+            {print}
+          ' "$FORMULA" > /tmp/formula.tmp && mv /tmp/formula.tmp "$FORMULA"
+
+          # Linux
+          awk -v sha="$SHA_LINUX" '
+            /linux-x86_64\.tar\.gz/{found_linux=1}
+            found_linux && /sha256/{sub(/"[a-fA-F0-9]+"/, "\"" sha "\""); found_linux=0}
+            {print}
+          ' "$FORMULA" > /tmp/formula.tmp && mv /tmp/formula.tmp "$FORMULA"
+
+          echo "--- Updated formula ---"
+          cat "$FORMULA"
+
+      - name: Commit and push
+        run: |
+          V="${{ steps.version.outputs.version }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add Formula/sentinel.rb
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+
+          git commit -m "chore: update sentinel to v${V}"
+          git push origin main
+
+      - name: Open PR if push fails (protected branch fallback)
+        if: failure()
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          commit-message: "chore: update sentinel to v${{ steps.version.outputs.version }}"
+          title: "chore: update sentinel to v${{ steps.version.outputs.version }}"
+          body: |
+            Automated formula update for sentinel v${{ steps.version.outputs.version }}.
+
+            SHA256 values updated from release assets.
+          branch: "update/sentinel-v${{ steps.version.outputs.version }}"
+          base: main
